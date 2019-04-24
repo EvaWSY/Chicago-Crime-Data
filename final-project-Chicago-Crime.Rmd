@@ -1,0 +1,429 @@
+  ---
+title: "Chicago Crime Analysis"
+author: "Eva Shuyu Wang"
+date: "10/15/2018"
+output: html_document
+---
+
+```{r packages, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ROCR)
+library(dplyr)
+library(gplots)
+library(randomForest)
+library(robustHD)
+library(naivebayes)
+library(ggplot2)
+library(knitr)
+```
+
+#Read in data 
+```{r}
+crime.data<-read.csv('Crimes_-_2001_to_present.csv',stringsAsFactors = FALSE)
+# Restrict to BURGLARY
+burglary.data <- filter(crime.data,crime.data$Primary.Type =='BURGLARY')
+colnames(burglary.data)
+```
+
+
+#Data Cleaning
+```{r cleaning}
+#Elimite data with missing values, 353107 observations
+burglary<-na.omit(burglary.data)
+#summary(burglary)
+
+# Convert Date
+burglary$Date <- as.POSIXct(burglary$Date, format="%m/%d/%Y %I:%M:%S %p", tz="UTC")
+burglary$Month = months(burglary$Date)
+burglary$Weekday = weekdays(burglary$Date)
+burglary$Year = year(burglary$Date)
+
+#plot patterns across time series
+hist(burglary$Year, breaks=100)
+#hist(burglary$Month, breaks=100)
+barplot(table(burglary$Month))
+# save plot as png
+#dev.copy(png, 'month_freq.png')
+#dev.off()
+table(burglary$Weekday)
+
+
+# Crime locations
+topcrimelocation=sort(table(burglary$Location.Description))
+table(burglary$Location.Description)[which.max(table(burglary$Location.Description))]
+
+#Check data types for each variable
+sapply(burglary,class)
+
+## Convert variable types as necessary
+burglary <- burglary %>% mutate( Weekday = as.factor(Weekday),
+                                 Description = as.factor(Description),
+                                 Location.Description = as.factor(Location.Description),
+                                 Arrest = as.factor(Arrest),
+                                 Domestic = as.factor(Domestic),
+                                 #Year = as.factor(Year),
+                                 Month  = as.factor(Month),
+                                 Weekday = as.factor(Weekday)
+                      )
+# Filter to complete cases, then split into train and test sets
+burglary<- burglary %>% filter(complete.cases(burglary))
+
+# split by year
+train <- burglary %>% filter(Year<2010)
+test <- burglary %>% filter(Year>2010 | Year==2010)
+
+
+#toplocations %>% count(word) %>% arrange(desc(n)) %>% slice(1:20)
+```
+
+
+
+#11/05/2018
+# Read in and clean full data
+```{r}
+# Bulgary Data combined with demographic data
+burglary.complete.data<-read.csv('../data/Burglary_wNeigh_Final.csv',stringsAsFactors = FALSE)
+# Restrict to complete cases and remove duplicates
+burglary <- burglary.complete.data %>% filter(complete.cases(burglary.complete.data)) %>% distinct
+dim(burglary)
+
+# Changing column name
+colnames(burglary)[which(names(burglary) == "Descriptio")] <- "Description"
+colnames(burglary)[which(names(burglary) == "Location_D")] <- "Location.Description"
+colnames(burglary)[which(names(burglary) == "Case_Numbe")] <- "Case_Number"
+colnames(burglary)[which(names(burglary) == "Case_Numbe")] <- "Case_Number"
+colnames(burglary)[which(names(burglary) == "X_Coordina")] <- "X_Coordinate"
+colnames(burglary)[which(names(burglary) == "Y_Coordina")] <- "Y_Coordinate"
+
+# Remove variables not needed in this analysis
+burglary <- burglary %>% select(-X,-IUCR,-Beat,-FID,-Primary_Ty,-FID_2, -STATEFP10,
+                                -COUNTYFP10, -TRACTCE10, -GEOID10,-NAME10,-NAMELSAD10,
+                                -MTFCC10,-FUNCSTAT10,-ALAND10,-AWATER10,-INTPTLAT10,-INTPTLON10)
+
+# Only keep records with values in the range. 
+burglary <- burglary %>% filter(total_hous >0,
+                                 total_pop >0,
+                                 median_age >0 & median_age <90,
+                                 Per_Pov >=0 & Per_Pov <100,
+                                 Per_Grad >=0 & Per_Grad <100,
+                                 Per_Vac >=0 & Per_Vac <100,
+                                 Per_Min >=0 & Per_Min <100,
+                                 Per_White >=0 & Per_White <100,
+                                 Per_Native >=0 & Per_Native <100,
+                                 Per_HSLess>=0 & Per_HSLess <100,
+                                 Per_SC>=0 & Per_SC <100,
+                                 Per_Bach>=0 & Per_Bach <100,
+                                 Per_FB >=0 & Per_FB <100
+                                 )
+
+# Check data types of each variable and convert to factors as necessary
+sapply(burglary,class)
+burglary <- burglary %>% mutate(Arrest = as.factor(Arrest),
+                      Description = as.factor(Description),
+                      Location.Description = as.factor(Location.Description),
+                      Year = as.factor(Year),
+                      Month = as.factor(Month),
+                      Weekday = as.factor(Weekday),
+                      Ward = as.factor(Ward),
+                      District = as.factor(District),
+                      Domestic = as.factor(Domestic))
+
+# random forest cannot handle predictors with more than 53 categories, thus keep 50 most common categories in location.description
+burglary <-burglary %>% filter(Location.Description %in% names(head(sort(table(burglary$Location.Description),decreasing = TRUE),50)))
+burglary<- droplevels(burglary)
+
+#Train-test split
+train <- burglary %>% filter(Year%in% c(2006,2007,2008,2009))
+test <- burglary %>% filter(Year %in% c(2010))
+
+# Remove locations that only exist in test data 
+test <- test %>% filter(Location.Description %in% train$Location.Description)
+
+# separately standardize real-valued attributes for train/test sets
+train <- train %>% mutate( total_hous = standardize( total_hous),
+                          total_pop = standardize(total_pop),
+                          Per_Vac = standardize(Per_Vac),
+                          Per_Min = standardize(Per_Min),
+                          Per_Min = standardize(Per_Min),
+                          Per_FB = standardize(Per_FB),
+                          Per_HSLess = standardize(Per_HSLess),
+                          Per_SC = standardize(Per_SC),
+                          Per_Bach = standardize(Per_Bach),
+                          Per_Grad = standardize(Per_Grad),
+                          Per_Pov = standardize(Per_Pov),
+                          Avg_Burg = standardize(Avg_Burg),
+                         Longitude = standardize(Longitude),
+                          Latitude = standardize(Latitude)
+)
+
+test <- test %>% mutate(total_hous = standardize( total_hous),
+                          total_pop = standardize(total_pop),
+                          Per_Vac = standardize(Per_Vac),
+                          Per_Min = standardize(Per_Min),
+                          Per_Min = standardize(Per_Min),
+                          Per_FB = standardize(Per_FB),
+                          Per_HSLess = standardize(Per_HSLess),
+                          Per_SC = standardize(Per_SC),
+                          Per_Bach = standardize(Per_Bach),
+                          Per_Grad = standardize(Per_Grad),
+                          Per_Pov = standardize(Per_Pov),
+                          Avg_Burg = standardize(Avg_Burg),
+                         Longitude = standardize(Longitude),
+                          Latitude = standardize(Latitude))
+
+```
+
+```{r}
+# data is highly imbalanced 0.94:0.06
+table(burglary$Arrest)
+# downsampling 
+balanced<-downSample(burglary,burglary$Arrest)
+dim(balanced)
+table(balanced$Arrest)
+#Train-test split
+train.balanced <- balanced %>% filter(Year%in% c(2006,2007,2008,2009))
+test.balanced <- balanced%>% filter(Year %in% c(2010))
+
+# Remove locations that only exist in test data 
+test.balanced <- test.balanced %>% filter(Location.Description %in% train$Location.Description)
+
+# separately standardize real-valued attributes for train/test sets
+train.balanced <- train.balanced %>% mutate( total_hous = standardize( total_hous),
+                          total_pop = standardize(total_pop),
+                          Per_Vac = standardize(Per_Vac),
+                          Per_Min = standardize(Per_Min),
+                          Per_Min = standardize(Per_Min),
+                          Per_FB = standardize(Per_FB),
+                          Per_HSLess = standardize(Per_HSLess),
+                          Per_SC = standardize(Per_SC),
+                          Per_Bach = standardize(Per_Bach),
+                          Per_Grad = standardize(Per_Grad),
+                          Per_Pov = standardize(Per_Pov),
+                          Avg_Burg = standardize(Avg_Burg),
+                         Longitude = standardize(Longitude),
+                          Latitude = standardize(Latitude)
+)
+
+test.balanced <- test.balanced %>% mutate(total_hous = standardize( total_hous),
+                          total_pop = standardize(total_pop),
+                          Per_Vac = standardize(Per_Vac),
+                          Per_Min = standardize(Per_Min),
+                          Per_Min = standardize(Per_Min),
+                          Per_FB = standardize(Per_FB),
+                          Per_HSLess = standardize(Per_HSLess),
+                          Per_SC = standardize(Per_SC),
+                          Per_Bach = standardize(Per_Bach),
+                          Per_Grad = standardize(Per_Grad),
+                          Per_Pov = standardize(Per_Pov),
+                          Avg_Burg = standardize(Avg_Burg),
+                         Longitude = standardize(Longitude),
+                          Latitude = standardize(Latitude))
+```
+```{r}
+# Observing the structure of cleanded data
+glimpse(burglary)
+```
+
+
+# EDA
+- Empirical Distributions
+- heatmap, treemap, stream graph... 
+- Neighbourhood
+- visualize in map?
+- What predictors lead to high arrest rate
+```{r}
+barplot(table(burglary$Arrest),)
+# 5.7% of the cases lead to arrest
+
+hist(burglary$total_pop)
+dev.copy(png, 'pop_freq.png')
+
+
+#burglary by day
+barplot(sort(table(burglary$Weekday)), cex.names=.8,ylab = "number of burgaries")
+
+#by year
+barplot(table(burglary$Year), cex.names=.8,ylab = "number of burglaries")
+
+
+#hist(burglary$Month, breaks=100)
+barplot(sort(table(burglary$Month)), las=2, cex.names=.8,ylab = "number of burgaries")
+
+table(burglary$Weekday)
+
+# Crime locations
+topcrimelocation=head(sort(table(burglary$Location.Description),decreasing = TRUE),5)
+barplot(topcrimelocation,cex.names=.7,ylab = "number of burglaries")
+```
+
+# Modeling
+- Use Caret package?
+- remove beat? too many levels 
+```{r logistic Regression}
+### FIT LOGISTIC MODEL ON TRAINING SET ###
+# Predictors include: 1. location, and distirct, and geographical info 2. month and week. 3. Social Factors of the neighborhood
+# Beat is not included since it has too many levels.  
+lr <- glm(Arrest ~ Description+Location.Description+District+
+            Longitude+Latitude+ Month+Weekday+
+            total_hous + total_pop + median_age + Per_Vac + Per_Min + 
+            Per_FB + Per_HSLess + Per_SC + Per_Bach + Per_Grad + Per_Pov + Avg_Burg, 
+          data=train, family = 'binomial')
+# Generate predictions on test set.
+test$predicted.probability <- predict(lr, newdata = test, type='response') 
+# compute AUC using ROCR package
+test.pred <- prediction(test$predicted.probability, test$Arrest)
+test.perf <- performance(test.pred, "auc")
+cat('the auc score is ', 100*test.perf@y.values[[1]], "\n")
+
+#Compute accuracy (too high due to imbalance of data)
+test.balanced$predicted_class = ifelse(test.balanced$predicted.probability > 0.5, 'true', 'false')
+accuracy <- mean(test.balanced$Arrest == test.balanced$predicted_class)
+
+# Logistic Regression with balanced data
+lr.balanced <- glm(Arrest ~ Description+Location.Description+District+
+            Longitude+Latitude+ Month+Weekday+
+            total_hous + total_pop + median_age + Per_Vac + Per_Min + 
+            Per_FB + Per_HSLess + Per_SC + Per_Bach + Per_Grad + Per_Pov + Avg_Burg, 
+          data=train.balanced, family = 'binomial')
+# Generate predictions on test set.
+test.balanced$predicted.probability <- predict(lr.balanced, newdata = test.balanced, type='response') 
+# compute AUC using ROCR package
+test.pred <- prediction(test.balanced$predicted.probability, test.balanced$Arrest)
+test.perf <- performance(test.pred, "auc")
+cat('the auc score is ', 100*test.perf@y.values[[1]], "\n")
+
+# Five largest and ten smallest (in magnitude) coefficients, not including the intercept
+largest10 <- sort(abs(lr$coefficients[-1]), decreasing = TRUE)[0:5]
+smallest10 <- sort(abs(lr$coefficients[-1]), decreasing = FALSE)[0:5]
+kable(data.frame(largest10), align='c', format='markdown')
+kable(data.frame(smallest10), align='c', format='markdown')
+
+
+```
+
+```{r naive bayes}
+# Naive Bayes
+nb<-naive_bayes(Arrest ~ Description+Location.Description+District+
+             Longitude+Latitude+ Month+Weekday+
+            total_hous + total_pop + median_age + Per_Vac + Per_Min + 
+            Per_FB + Per_HSLess + Per_SC + Per_Bach + Per_Grad + Per_Pov + Avg_Burg,
+            data=train)
+
+# Predictions
+test$predicted.probability.nb <- predict(nb, newdata=test, type='prob')[,2]
+# compute AUC using ROCR package
+test.pred <- prediction(test$predicted.probability.nb, test$Arrest)
+test.perf <- performance(test.pred, "auc")
+cat('the auc score is ', 100*test.perf@y.values[[1]], "\n")
+
+# Naive Bayes with balanced data
+nb.balanced<-naive_bayes(Arrest ~ Description+Location.Description+District+
+             Longitude+Latitude+ Month+Weekday+
+            total_hous + total_pop + median_age + Per_Vac + Per_Min + 
+            Per_FB + Per_HSLess + Per_SC + Per_Bach + Per_Grad + Per_Pov + Avg_Burg,
+            data=train.balanced)
+
+# Predictions
+test.balanced$predicted.probability.nb <- predict(nb.balanced, newdata=test.balanced, type='prob')[,2]
+# compute AUC using ROCR package
+test.pred <- prediction(test.balanced$predicted.probability.nb, test.balanced$Arrest)
+test.perf <- performance(test.pred, "auc")
+cat('the auc score is ', 100*test.perf@y.values[[1]], "\n")
+```
+
+```{r random forest}
+set.seed(123)
+rf <- randomForest(Arrest ~ Description+Location.Description+District+
+             Longitude+Latitude+ Month+Weekday+
+            total_hous + total_pop + median_age + Per_Vac + Per_Min + 
+            Per_FB + Per_HSLess + Per_SC + Per_Bach + Per_Grad + Per_Pov + Avg_Burg,
+            data=train,
+            importance= TRUE,
+            ntree = 200)
+
+# Predicted Probability and AUC
+# generate predictions for test set
+predicted.probability.rf <- predict(rf, newdata = test, type='prob') 
+test$predicted.probability.rf <-predicted.probability.rf[ ,2]
+
+# compute AUC using ROCR package
+test.pred <- prediction(test$predicted.probability.rf, test$Arrest)
+test.perf <- performance(test.pred, "auc")
+cat('the auc score for test_half is ', 100*test.perf@y.values[[1]], "\n") 
+
+# Feature Importance plot
+varImpPlot(rf,type=1)
+# predicted vs actual plot
+#plot(test$predicted.probability.rf)
+
+set.seed(123)
+rf.balanced <- randomForest(Arrest ~ Description+Location.Description+District+
+             Longitude+Latitude+ Month+Weekday+
+            total_hous + total_pop + median_age + Per_Vac + Per_Min + 
+            Per_FB + Per_HSLess + Per_SC + Per_Bach + Per_Grad + Per_Pov + Avg_Burg,
+            data=train.balanced,
+            importance= TRUE,
+            ntree = 200)
+
+# Predicted Probability and AUC
+# generate predictions for test set
+predicted.probability.rf <- predict(rf.balanced, newdata = test.balanced, type='prob') 
+test.balanced$predicted.probability.rf <-predicted.probability.rf[ ,2]
+
+# compute AUC using ROCR package
+test.pred <- prediction(test.balanced$predicted.probability.rf, test.balanced$Arrest)
+test.perf <- performance(test.pred, "auc")
+cat('the auc score for test_half is ', 100*test.perf@y.values[[1]], "\n") 
+
+```
+
+
+# Evalutaion
+- Accuracy, ROC curve plot, AUC, precison and recall?
+```{r}
+# Comparing models on Performance plot
+plot.data <- test.balanced %>% arrange(desc(predicted.probability)) %>% 
+  mutate(numincidents = row_number(), percent.outcome = cumsum(as.numeric(Arrest))/sum(as.numeric(Arrest)),
+         incidents = numincidents/n()) %>% select(incidents, percent.outcome)
+
+plot.data.nb <- test.balanced%>% arrange(desc(predicted.probability.nb)) %>% 
+  mutate(numincidents = row_number(), percent.outcome = cumsum(as.numeric(Arrest))/sum(as.numeric(Arrest)),
+         incidents = numincidents/n()) %>% select(incidents, percent.outcome)
+
+plot.data.rf <- test.balanced %>% arrange(desc(predicted.probability.rf)) %>% 
+  mutate(numincidents = row_number(), percent.outcome = cumsum(as.numeric(Arrest))/sum(as.numeric(Arrest)),
+         incidents = numincidents/n()) %>% select(incidents, percent.outcome)
+
+# create and save plot
+theme_set(theme_bw())
+p <- ggplot() 
+p<- p +  geom_line(data=plot.data, aes(x=incidents, y=percent.outcome),colour = 'red',linetype = "dotdash")
+p <- p + geom_line(data=plot.data.nb, aes(x=incidents, y=percent.outcome),colour = 'blue')
+p <- p + geom_line(data=plot.data.rf, aes(x=incidents, y=percent.outcome),colour = 'green', linetype= 2)
+p <- p + scale_color_discrete(name = "Model", labels = c("Logistic Regression", "Naive Bayes","RandomForest"))
+p <- p + scale_x_log10('\nPercent of incidents', limits=c(0.003, 1), breaks=c(.003,.01,.03,.1,.3,1), labels=c('0.3%','1%','3%','10%','30%','100%'))
+p <- p + scale_y_continuous("Percent of Arrest made", limits=c(0, 1), labels=scales::percent)
+p
+ggsave(plot=p, file='performance_plot10_30.pdf', height=5, width=5)
+
+# Plot ROC curves
+# List of predictions
+preds_list <- list(test$predicted.probability,test$predicted.probability.nb, test$predicted.probability.rf)
+
+# List of actual values (same for all)
+m <- length(preds_list)
+actuals_list <- rep(list(test$Arrest), m)
+
+# Plot the ROC curves
+pred <- prediction(preds_list, actuals_list)
+rocs <- performance(pred, "tpr", "fpr")
+plot(rocs, col = as.list(1:m), main = "Test Set ROC Curves")
+legend(x = "bottomright", 
+       legend = c("Logistic Regression", "Naive Bayes", "Random Forest"),
+       fill = 1:m)
+dev.copy(png,'roc_plot.png')
+dev.off()
+```
+breaks=c(.003,.01,.03,.1,.3,1), 
+                       labels=c('0.3%','1%','3%','10%','30%','100%'))
